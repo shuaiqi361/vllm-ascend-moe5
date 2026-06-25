@@ -50,6 +50,16 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 
+try:
+    from vllm_ascend.dump.tensor_dump import DUMPER
+except Exception:
+    class _NoDump:
+        enabled = False
+        _dbg = False
+        def record_router_io(self, *a, **k): pass
+        def record_topk(self, *a, **k): pass
+    DUMPER = _NoDump()
+
 from vllm_ascend.expert_offload.expert_offload_manager import (
     has_expert_offload_manager, get_expert_offload_manager)
 
@@ -1007,6 +1017,9 @@ class AscendFusedMoE(FusedMoE):
             before_routed_experts = torch.npu.current_stream().record_event()
             router_logits = F.linear(hidden_states_fp32, gate.weight_fp32)
             after_routed_experts = torch.npu.current_stream().record_event()
+            # capture the TRUE router input (bf16 MoE input) and the real fp32 gate logits here
+            if DUMPER.enabled:
+                DUMPER.record_router_io(hidden_states, router_logits)
         else:
             before_routed_experts = torch.npu.current_stream().record_event()
             after_routed_experts = None

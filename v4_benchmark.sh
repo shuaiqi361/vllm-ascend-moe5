@@ -184,7 +184,7 @@ build_additional_config() {
       seq_keys=",\"seq_stats_warmup_seqs\":${SEQ_WARMUP},\"seq_stats_num_seqs\":${SEQ_NUM}"
       [[ "${TIMING}" == "1" ]] && seq_keys="${seq_keys},\"cache_profile_timing\":true"
     fi
-    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key},\"cache_debug_log_updates\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
+    parts+=( "\"expert_offload_config\":{\"expert_offload\":true,\"num_device_experts\":${NUM_DEVICE_EXPERTS},\"num_device_layers\":${NUM_DEVICE_LAYERS},\"cache_policy_enabled\":$(bool "${CACHE_POLICY}")${prefetch_key},\"moe_offload_debug\":$(bool "${CACHE_DEBUG}")${seq_keys}}" )
   fi
   [[ "${WPREFETCH}" == "1" ]] && parts+=( "\"weight_prefetch_config\":{\"enabled\":true}" )
   [[ ${#parts[@]} -eq 0 ]] && return

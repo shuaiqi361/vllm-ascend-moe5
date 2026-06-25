@@ -234,32 +234,31 @@ class _Dumper:
             f"expected ({expected_len},). Tap is at the wrong place or the layout changed.")
         return v
 
-    def record_routing(self, hidden_states, router_logits, topk_ids):
-        # NEW: called from select_experts for every layer (hash + routed). The layer is
-        # identified by self._cur_layer, which mark_pre_attn() stamped from the ACTUAL
-        # layer.layer_idx when this same layer's input_layernorm ran (always before its
-        # MoE). So files are named by real layer id, never by call order. Hash layers
-        # have no stamp (cur_layer stays < num_hash) and are skipped.
+    def record_router_io(self, hidden_states, router_logits):
+        # bf16 router input + fp32 gate logits, captured at the gate site (pre-prepare).
         if not self.enabled or not self._in_fwd or not self._capture:
             return
         with self._lock:
             layer_idx = self._cur_layer
             if layer_idx < self.num_hash or layer_idx >= self.num_total:
-                return  # hash layer, or no valid current-layer stamp -> not a dumped layer
-            if self._dbg and self._dbg_route_shape:
-                self._dbg_route_shape = False
-                print(f"[DUMP-DEBUG] routing tap fired @ layer {layer_idx}: hidden_states={tuple(hidden_states.shape)} "
-                      f"router_logits={tuple(router_logits.shape)} topk_ids={tuple(topk_ids.shape)}. "
-                      f"router_logits last dim should == n_routed_experts ({self.n_routed_experts}).", flush=True)
-            # Assert-then-offload: slice to 1-D, validate shape, then copy to host.
+                return
             ri = self._slice1d(hidden_states, self.hidden_size, "router_input")
             rl = self._slice1d(router_logits, self.n_routed_experts, "router_logits")
-            tk = self._slice1d(topk_ids, self.num_experts_per_tok, "topk_ids")
             d = self._buf.setdefault(f"L{layer_idx:02d}", {})
-            d["router_input"]  = ri.detach().to(torch.bfloat16).clone().cpu()
+            d["router_input"] = ri.detach().to(torch.bfloat16).clone().cpu()
             d["router_logits"] = rl.detach().to(torch.float32).clone().cpu()
-            d["topk_ids"]      = tk.detach().to(torch.int16).clone().cpu()
-            self._f_route += 1
+
+    def record_topk(self, topk_ids):
+        # routed-only selected expert ids, captured in select_experts (its only source).
+        if not self.enabled or not self._in_fwd or not self._capture:
+            return
+        with self._lock:
+            layer_idx = self._cur_layer
+            if layer_idx < self.num_hash or layer_idx >= self.num_total:
+                return
+            tk = self._slice1d(topk_ids, self.num_experts_per_tok, "topk_ids")
+            self._buf.setdefault(f"L{layer_idx:02d}", {})["topk_ids"] = (
+                tk.detach().to(torch.int16).clone().cpu())
 
     def mark_pre_attn(self, layer_idx, x):
         # NEW: called from a forward hook on each non-hash layer's input_layernorm, which

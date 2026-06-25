@@ -140,7 +140,7 @@ def select_experts(
     # No-op unless DUMP=1. The dumper attributes these to the ACTUAL layer id (stamped
     # by this layer's input_layernorm hook), not by call order.
     if DUMPER.enabled:
-        DUMPER.record_routing(hidden_states, router_logits, topk_ids)
+        DUMPER.record_topk(topk_ids)
 
     if mix_placement:
         shared_expert_routing_factor = 1.0 if is_support_npu_moe_gating_top_k else (1 / routed_scaling_factor)
