@@ -27,6 +27,7 @@ import math
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
+import time
 
 import torch
 import torch.nn.functional as F
@@ -87,6 +88,11 @@ if vllm_version_is("0.21.0"):
 else:
     from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
     from vllm.models.deepseek_v4.compressor import CompressorStateCache
+
+
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX  # v10
+from vllm_ascend.expert_offload.expert_offload_manager import (  # v10
+    has_expert_offload_manager, get_expert_offload_manager)
 
 
 def hadamard_transform_ref(x: torch.Tensor, scale=1.0):
@@ -855,7 +861,20 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
+        # edits: add timing
+        _atmgr = None
+        if has_expert_offload_manager() and hasattr(self.mlp, "experts"):
+            _m = get_expert_offload_manager()
+            if (_m._profile_timing and not _EXTRA_CTX.capturing
+                    and hidden_states.shape[0] <= _m.offload_threshold):
+                _atmgr = _m
+        if _atmgr is not None:
+            torch_npu.npu.current_stream().synchronize(); _t_attn = time.perf_counter()
         hidden_states = self.self_attn(**attn_kwargs)
+        if _atmgr is not None:
+            torch_npu.npu.current_stream().synchronize()
+            _atmgr.record_attention_time(self.mlp.experts, (time.perf_counter() - _t_attn) * 1000.0)
+            
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
@@ -1086,6 +1105,63 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         self.quant_config = quant_config
 
         self.model = self.model_cls(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+
+        # NEW: tensor-dump wiring. No-op unless DUMP=1. The serve worker runs this
+        # __init__, so wiring here makes capture work under `vllm serve`.
+        # Run flags: --enforce-eager (eager, not aclgraph), --max-num-seqs 1 (one
+        # sequence per forward), --no-enable-prefix-caching (new seq == position 0),
+        # --max-num-batched-tokens >= max-model-len (no prefill chunking). PP=1, EP=1.
+        from vllm_ascend.dump.tensor_dump import DUMPER
+        if DUMPER.enabled:
+            DUMPER.configure(
+                hidden_size=config.hidden_size,
+                n_routed_experts=config.n_routed_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                num_hash_layers=config.num_hash_layers,
+                num_hidden_layers=config.num_hidden_layers,
+                scoring_func=getattr(config, "scoring_func", "softmax"),
+            )
+
+            # begin/end_forward are driven by wrapping THIS module's forward (the
+            # ForCausalLM). We do NOT hook self.model: it is @support_torch_compile,
+            # whose __call__ skips nn.Module hooks. Wrapping the bound forward fires
+            # whether the runner calls __call__ or .forward() directly.
+            _orig_forward = self.forward
+
+            def _dump_forward(*args, **kwargs):
+                ii = kwargs.get("input_ids", args[0] if len(args) > 0 else None)
+                pp = kwargs.get("positions", args[1] if len(args) > 1 else None)
+                if ii is not None and pp is not None:
+                    DUMPER.begin_forward(ii, pp)
+                elif DUMPER._dbg:
+                    print(f"[DUMP-DEBUG] forward wrapper ran but input_ids/positions not found "
+                          f"(positional args={len(args)}, kwarg names={list(kwargs)}); "
+                          f"begin_forward SKIPPED", flush=True)
+                try:
+                    return _orig_forward(*args, **kwargs)
+                finally:
+                    DUMPER.end_forward()
+
+            self.forward = _dump_forward
+
+            # Layer marker + pre_attn_input: a hook on each non-hash layer's
+            # input_layernorm (a plain RMSNorm whose hooks DO fire under eager). It
+            # stamps the ACTUAL layer_idx (so the MoE tap attributes router_*/topk_ids
+            # to this layer, not by call order) and saves pre_attn_input.
+            # NOTE: .hash lives on the MoE (layer.mlp), NOT on the decoder layer, so we
+            # identify hash layers by layer_idx < num_hash_layers (same test the routing
+            # tap uses). Using getattr(layer,"hash") would skip nothing and over-collect.
+            _num_hash = config.num_hash_layers
+            for _layer in self.model.layers:
+                if not hasattr(_layer, "input_layernorm") or not hasattr(_layer, "layer_idx"):
+                    continue  # PP-missing placeholder
+                if _layer.layer_idx < _num_hash:
+                    continue  # hash layers 0..num_hash-1 are not dumped
+                _idx = _layer.layer_idx
+                _layer.input_layernorm.register_forward_hook(
+                    (lambda idx: (lambda _m, _i, _o: DUMPER.mark_pre_attn(idx, _o)))(_idx)
+                )
+
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,

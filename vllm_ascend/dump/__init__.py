@@ -1,0 +1,1 @@
+from vllm_ascend.dump.tensor_dump import DUMPER  # noqa: F401

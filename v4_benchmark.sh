@@ -19,16 +19,16 @@ set -uo pipefail
 
 # ─── EDIT HERE ▸ 1. WHAT TO RUN ──────────────────────────────────────────────
 MODEL="${MODEL:-/data/keyi/llms/deepseek-v4-w8a8}"       # DeepSeek-V4 W8A8 checkpoint
-CARD="${CARD:-7}"                                    # NPU id (your env uses 7)
-SERVED_NAME="${SERVED_NAME:-glm-5}"                  # must match server <-> bench client
+CARD="${CARD:-6}"                                    # NPU id (your env uses 7)
+SERVED_NAME="${SERVED_NAME:-deepseek-v4-w8a8-mtp}"                  # must match server <-> bench client
 PORT="${PORT:-7001}"
 
 # ─── EDIT HERE ▸ 2. WORKLOAD (serve client) ──────────────────────────────────
 DATASET="${DATASET:-sharegpt}"                                                                                         # random | random-mm | sharegpt | sonnet | hf | ...
-DATASET_PATH="${DATASET_PATH:-/data/keyi/llms/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json}"                     # required for non-random datasets
+DATASET_PATH="${DATASET_PATH:-/data/keyi/llms/sharegpt/ShareGPT_V3_unfiltered_cleaned_split_trim_1024.json}"                     # required for non-random datasets
 ILEN="${ILEN:-256}"                                  # input length  (tokens)
 OLEN="${OLEN:-128}"                                  # output length (tokens)
-NUM="${NUM:-10}"                                     # number of prompts
+NUM="${NUM:-3}"                                     # number of prompts
 RANGE_RATIO="${RANGE_RATIO:-0}"                      # 0 = fixed lengths (random datasets)
 RATE="${RATE:-inf}"                                  # request rate req/s; inf = max load
 
@@ -36,10 +36,11 @@ RATE="${RATE:-inf}"                                  # request rate req/s; inf =
 TP="${TP:-1}"                                        # --tensor-parallel-size
 DP="${DP:-1}"                                        # --data-parallel-size
 SEED="${SEED:-1024}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.9}"                  # your V4 command used 0.9
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.95}"                  # your V4 command used 0.9
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"                # empty = model native
-MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-}"      # empty = vLLM default
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"                 # empty = model native
+MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-}"       # empty = vLLM default
+OUTPUT_LEN="${OUTPUT_LEN:-}"                       # empty = vLLM default, otherwise clamp
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"                  # 1 = --enforce-eager
 
 # ─── EDIT HERE ▸ 4. MoE OFFLOAD FEATURE (V4 values from your command) ─────────
@@ -77,6 +78,7 @@ EP="${EP:-1}"                                        # 1 = --enable-expert-paral
 
 # ─── EDIT HERE ▸ 5. DeepSeek-V4 PARSER/TOKENIZER FLAGS (the V4 adaptation) ────
 V4_MODE="${V4_MODE:-1}"                              # 1 = add the deepseek_v4 tokenizer/tool/reasoning flags
+WITH_MTP=0                                           # 0 = disable MTP network
 
 # ─── EDIT HERE ▸ 6. PROFILER (your command has it ON) ────────────────────────
 PROFILE="${PROFILE:-0}"                             # 1 = attach torch profiler (set 0 for clean perf numbers)
@@ -87,7 +89,29 @@ PROFILE_WITH_STACK="${PROFILE_WITH_STACK:-0}"
 ADDITIONAL_CONFIG_RAW="${ADDITIONAL_CONFIG_RAW:-}"   # paste full JSON to OVERRIDE section 4
 EXTRA_ENGINE_FLAGS=( ${EXTRA_ENGINE_ARGS:-} )        # raw flags appended to `vllm serve`
 EXTRA_BENCH_FLAGS=(  ${EXTRA_BENCH_ARGS:-}  )        # raw flags appended to `vllm bench serve` (client)
-SERVE_ONLY_FLAGS=( --enable-chunked-prefill --enable-prefix-caching
+[[ -n "${OUTPUT_LEN}" ]]         && EXTRA_BENCH_FLAGS+=( --output-len "${OUTPUT_LEN}" )
+
+# ─── DUMP ▸ TENSOR-DUMP CAPTURE (per-layer router/activation dump) ───────────
+# Defined here (before SERVE_ONLY_FLAGS) so the conditional prefix-cache flag
+# below can see DUMP. DUMP=0 (default) leaves this script's behavior unchanged.
+# Requires the dump SOURCE edits (driver + select_experts tap + model __init__
+# wiring) applied to THIS build; DUMP=1 is a no-op without them.
+DUMP="${DUMP:-0}"                                    # 1 = enable per-layer tensor dump
+# DUMP_DIR="${DUMP_DIR:-./dumps/$(date +%Y%m%d_%H%M%S)}"   # fresh dir per run (don't overwrite)
+DUMP_DIR="${DUMP_DIR:-/data/keyi/llms/sharegpt/pre-att-dump}"   # fresh dir per run (don't overwrite)
+DUMP_PLATFORM="${DUMP_PLATFORM:-npu}"                # tag written into metadata.json
+# Files saved per sequence are bounded by the requested output length: with OUTPUT_LEN
+# set, the client asks for exactly that many output tokens, so each sequence yields
+# OUTPUT_LEN token_*.pt files (1 prefill + OUTPUT_LEN-1 decode). This is passed to the
+# dumper as a hard safety cap; empty OUTPUT_LEN => 0 => unlimited (rely on natural stop).
+DUMP_MAX_TOKENS="${OUTPUT_LEN:-0}"
+# CONFLICT FIX: prefix caching MUST be off while dumping (new sequences are
+# detected by prefill starting at position 0; prefix-cache hits skip that).
+# Non-dump runs keep the original --enable-prefix-caching untouched.
+if [[ "${DUMP}" == "1" ]]; then _PREFIX_CACHE_FLAG="--no-enable-prefix-caching"
+else                            _PREFIX_CACHE_FLAG="--enable-prefix-caching"; fi
+
+SERVE_ONLY_FLAGS=( --enable-chunked-prefill "${_PREFIX_CACHE_FLAG}"
                    --aggregate-engine-logging --safetensors-load-strategy prefetch
                    --api-server-count 1 )
 WAIT="${WAIT:-1000}"                                  # seconds to wait for /health
@@ -98,6 +122,13 @@ DRY_RUN="${DRY_RUN:-0}"                               # 1 = print command(s), do
 #  MACHINERY  —  you normally don't need to edit below this line
 # =============================================================================
 export ASCEND_RT_VISIBLE_DEVICES="${CARD}"
+
+# DUMP: export capture env so the `vllm serve` child (and its engine-core
+# subprocess) inherit it. Only when dumping, so non-dump runs export nothing new.
+if [[ "${DUMP}" == "1" ]]; then
+  export DUMP DUMP_DIR DUMP_PLATFORM DUMP_MAX_TOKENS
+  mkdir -p "${DUMP_DIR}"
+fi
  
 die()  { echo "ERROR: $*" >&2; exit 1; }
 bool() { [[ "${1}" == "1" ]] && echo true || echo false; }
@@ -237,6 +268,25 @@ print_summary() {
       echo "  warn: PREFETCH=1 but CACHE_POLICY=0 — prefetch falls back to arbitrary eviction (no LRC brain)."
     fi
   fi
+  # DUMP: capture status + conflict checks (only printed when dumping).
+  if [[ "${DUMP}" == "1" ]]; then
+    echo "  DUMP=1 -> per-layer capture to ${DUMP_DIR} (platform=${DUMP_PLATFORM}); prefix-caching forced OFF"
+    echo "  files/seq capped by OUTPUT_LEN=${OUTPUT_LEN:-unset} -> max ${DUMP_MAX_TOKENS} token_*.pt per sequence (0=unlimited)"
+    [[ -z "${OUTPUT_LEN}" ]] && echo "  DUMP-warn: OUTPUT_LEN unset -> files/seq follow the natural generation stop; set OUTPUT_LEN to bound them"
+    echo "  note: needs the dump SOURCE edits applied to THIS build (moeoffload_v5/vLLM 0.21.0); else no-op"
+    echo "  note: expert-offload is fine for the dump (routing/select_experts runs before expert dispatch)"
+    [[ "${ENFORCE_EAGER}" != "1" ]] && echo "  DUMP-ERR: needs ENFORCE_EAGER=1 (graph mode captures stale values)"
+    [[ "${MAX_NUM_SEQS}" != "1" ]]  && echo "  DUMP-ERR: needs MAX_NUM_SEQS=1 (else sequences interleave in one forward)"
+    [[ "${DP}" != "1" ]]            && echo "  DUMP-ERR: needs DP=1 (multiple engine procs would each write to ${DUMP_DIR})"
+    if [[ "${EP}" == "1" ]]; then
+      echo "  DUMP-warn: --enable-expert-parallel is ON. The dump needs the router to see the FULL,"
+      echo "             unsplit token set on the writer rank. With one card (TP=DP=PP=1, world=1) EP"
+      echo "             shards nothing and is usually fine; if topk_ids/router rows look wrong, set EP=0."
+    fi
+    [[ -z "${MAX_BATCHED_TOKENS}" ]] && \
+      echo "  DUMP-warn: MAX_BATCHED_TOKENS unset — set it >= longest prompt so prefill isn't chunked"\
+           "(driver handles chunks, but a single-chunk prefill is simplest)."
+  fi
 }
  
 run_serve() {
@@ -287,6 +337,10 @@ run_serve() {
     grep -a "EXPERT-OFFLOAD-FINAL" "${log}" || \
       echo "[serve] no [EXPERT-OFFLOAD-FINAL] line yet — fewer than seq_stats_num_seqs=${SEQ_NUM} requests finished, the finished-request flush hook is not applied, or the seq-stats patch is missing on this build."
   fi
+  # DUMP: where the captured tensors landed.
+  if [[ "${DUMP}" == "1" ]]; then
+    echo "[serve] tensor dump written under ${DUMP_DIR} (per-seq folders; glob seq_*/token_*.pt)."
+  fi
 }
  
 # ─── dispatch (serve only) ───────────────────────────────────────────────────
@@ -328,6 +382,19 @@ run_serve
 #    * threshold warning  : computed as num_device_experts/TOPK (set TOPK to V4's
 #                           real top_k; only affects the warning).
 #
+#  TENSOR DUMP (DUMP=1):
+#    * DUMP=1 enables the per-layer router/activation capture. It exports
+#      DUMP/DUMP_DIR/DUMP_PLATFORM to the serve process and forces
+#      --no-enable-prefix-caching (the one hard conflict). DUMP=0 (default)
+#      leaves every existing flag and behavior exactly as before.
+#    * Already-satisfied requirements in this script: ENFORCE_EAGER=1,
+#      MAX_NUM_SEQS=1, DP=1, no PP, no --speculative-config (1 token/decode).
+#    * EP=1 (--enable-expert-parallel) is left as-is; on a single card (world=1)
+#      it shards nothing, so the dump is fine. If you ever run multi-card with
+#      EP, dump with EP=0 so the writer rank sees the full token set.
+#    * Example:  DUMP=1 ./bench_serve_v4.sh
+#                DUMP=1 DUMP_DIR=./dumps/npu_run1 MAX_BATCHED_TOKENS=2048 ./bench_serve_v4.sh
+#
 #  BUILD PREREQUISITES (the V4 checkout must have these or the keys are rejected
 #  / the logs won't appear):
 #    * expert_prefetch_enabled : present on v5.0 (the prefetch branch).
@@ -339,6 +406,10 @@ run_serve
 #      required for the [EXPERT-OFFLOAD-FINAL] line to appear DURING the run
 #      (before the grep). Without it the summary only prints at engine teardown
 #      via atexit, after the client step — the grep would miss it.
+#    * tensor-dump source edits (only needed for DUMP=1): the dump driver
+#      (vllm_ascend/dump/tensor_dump.py), the select_experts tap, and the model
+#      __init__ wiring — see the implementation guide. Without them DUMP=1 runs
+#      but writes nothing.
 #
 #  SPEC DECODE / MTP: this script passes no --speculative-config, so
 #  num_speculative_tokens=0 and decode steps carry 1 token/seq — fine for

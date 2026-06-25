@@ -26,6 +26,22 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
 
+# Dump intermediate tensors for training
+# NEW: tensor-dump hook. Defensive import so a missing/broken dump package never
+# breaks normal serving — falls back to an inert stub (enabled=False -> taps no-op).
+try:
+    from vllm_ascend.dump.tensor_dump import DUMPER
+except Exception:
+    class _NoDump:
+        enabled = False
+        _dbg = False
+        def configure(self, *a, **k): pass
+        def begin_forward(self, *a, **k): pass
+        def end_forward(self, *a, **k): pass
+        def record_routing(self, *a, **k): pass
+        def mark_pre_attn(self, *a, **k): pass
+    DUMPER = _NoDump()
+
 
 def select_experts(
     hidden_states: torch.Tensor,
@@ -117,6 +133,15 @@ def select_experts(
         # Apply routed scaling factor to weights
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * routed_scaling_factor
+
+    # NEW: dump tap. Captured HERE — before the `if mix_placement:` block appends
+    # shared-expert ids — so topk_ids stays routed-only (width == top_k == 6).
+    # hidden_states is the router input; router_logits is the raw pre-topk logits.
+    # No-op unless DUMP=1. The dumper attributes these to the ACTUAL layer id (stamped
+    # by this layer's input_layernorm hook), not by call order.
+    if DUMPER.enabled:
+        DUMPER.record_routing(hidden_states, router_logits, topk_ids)
+
     if mix_placement:
         shared_expert_routing_factor = 1.0 if is_support_npu_moe_gating_top_k else (1 / routed_scaling_factor)
         batch_size = topk_ids.shape[0]
