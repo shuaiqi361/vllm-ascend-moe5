@@ -32,6 +32,10 @@ class _Dumper:
         self.num_hash = 0
         self.num_total = 0
         self.n_keys = 0
+        # NEW: the 4 mandatory ("core") targets every dumped layer must have for a forward to
+        # be written. lrc_cache_hit is an OPTIONAL 5th target (decode-only), so the integrity
+        # gate counts these core keys instead of the total key count. (user request)
+        self._core_targets = ("router_input", "pre_attn_input", "router_logits", "topk_ids")
         self.hidden_size = 0
         self.n_routed_experts = 0
         self.num_experts_per_tok = 0
@@ -40,6 +44,7 @@ class _Dumper:
         self._n_begin = 0; self._n_written = 0; self._n_discard = 0
         self._f_pre = 0; self._f_route = 0   # per-forward tap-fire counts
         self._dbg_route_shape = True; self._dbg_pre_shape = True  # one-shot shape prints
+        self._dbg_cache_shape = True  # NEW: one-shot print for the lrc_cache_hit tap
         # per-forward state
         self._in_fwd = False
         self._capture = True      # False -> over the per-sequence cap: skip offload + write
@@ -79,25 +84,35 @@ class _Dumper:
             self.n_routed_experts = n_routed_experts
             self.num_experts_per_tok = num_experts_per_tok
             tags = [f"L{i:02d}" for i in range(num_hash_layers, num_hidden_layers)]
-            self.n_keys = len(tags) * 4
+            # NEW: n_keys counts only the 4 mandatory core targets (the gate's invariant).
+            # lrc_cache_hit is additive and decode-only, so it is NOT included here.
+            self.n_keys = len(tags) * len(self._core_targets)
             self._meta = {
                 "platform": os.environ.get("DUMP_PLATFORM", "npu"),
                 "model": {"hidden_size": hidden_size, "n_routed_experts": n_routed_experts,
                           "num_experts_per_tok": num_experts_per_tok, "scoring_func": scoring_func,
                           "dumped_layer_indices": list(range(num_hash_layers, num_hidden_layers))},
                 "target_order": ["router_input", "pre_attn_input", "router_logits", "topk_ids"],
+                # NEW: lrc_cache_hit registered as an optional, decode-only target aligned to topk_ids.
+                "optional_targets": ["lrc_cache_hit"],
                 "targets": {"router_input": {"dim": hidden_size, "dtype": "bfloat16"},
                             "pre_attn_input": {"dim": hidden_size, "dtype": "bfloat16"},
                             "router_logits": {"dim": n_routed_experts, "dtype": "float32"},
-                            "topk_ids": {"dim": num_experts_per_tok, "dtype": "int16"}},
+                            "topk_ids": {"dim": num_experts_per_tok, "dtype": "int16"},
+                            "lrc_cache_hit": {"dim": num_experts_per_tok, "dtype": "bool",
+                                              "availability": "decode_tokens_only",
+                                              "order": "aligned 1:1 with topk_ids (same routing order)",
+                                              "semantics": "1 = routed expert already resident in the LRC "
+                                                           "expert cache when the layer needed it; 0 = miss "
+                                                           "(loaded on demand). Absent on prefill token_00000."}},
                 "layer_tags": tags,
                 "key_scheme": "{layer_tag}.{target}  e.g. 'L03.router_logits'",
                 "layout": {
                     "<root>": "= DUMP_DIR, one directory per run",
-                    "<root>/metadata.json": "this file: run-level schema (model dims, the 4 targets, layer tags)",
+                    "<root>/metadata.json": "this file: run-level schema (model dims, the 4 core targets + optional lrc_cache_hit, layer tags)",
                     "<root>/seq_{i:06d}/": "one directory per generated sequence (one prompt at --max-num-seqs 1); enumerate by globbing seq_*",
                     "<root>/seq_{i:06d}/seq_meta.json": "that sequence's prompt_token_ids and output_token_ids (len == token-file count - 1)",
-                    "<root>/seq_{i:06d}/token_{j:05d}.pt": "one generated token (token_00000 = prefill/first token, token_k = decode k); a dict of {layer_tag}.{target} CPU tensors; load with torch.load(path, map_location='cpu', weights_only=True)",
+                    "<root>/seq_{i:06d}/token_{j:05d}.pt": "one generated token (token_00000 = prefill/first token, token_k = decode k); a dict of {layer_tag}.{target} CPU tensors; decode tokens additionally carry {layer_tag}.lrc_cache_hit. load with torch.load(path, map_location='cpu', weights_only=True)",
                 },
                 "file_format": {"serialization": "torch.save",
                                 "load": "torch.load(path, map_location='cpu', weights_only=True)"},
@@ -186,20 +201,23 @@ class _Dumper:
                 return
             row = {f"{tag}.{name}": t for tag, d in self._buf.items() for name, t in d.items()}
             self._buf = {}
-            # Integrity gate: a correct main-model forward yields exactly n_keys =
-            # (num_total - num_hash) * 4 entries, i.e. all dumped layers with all 4
-            # targets, each keyed by its real layer id. Anything else (warmup, draft/MTP,
+            # Integrity gate: a correct main-model forward yields all dumped layers with all 4
+            # CORE targets, each keyed by its real layer id. Anything else (warmup, draft/MTP,
             # a layer whose hooks didn't all fire, a misaligned stamp) is incomplete or
-            # mis-attributed -> discard and write nothing. With <=4 keys per tag and only
-            # 40 possible tags, len(row)==n_keys can ONLY be all 40 layers x 4 targets,
-            # so this guarantees correct per-layer attribution in every written file.
-            if len(row) != self.n_keys:
+            # mis-attributed -> discard and write nothing.
+            # CHANGE: gate on the count of CORE-target keys (== n_keys), not len(row). The
+            # optional decode-only lrc_cache_hit adds extra keys on decode tokens, so a total
+            # count would now exceed n_keys on decode and discard every decode forward. With
+            # <=4 core keys per tag and only (num_total-num_hash) possible tags, n_core==n_keys
+            # can ONLY be all dumped layers x 4 core targets -> correct per-layer attribution.
+            n_core = sum(1 for k in row if k.split(".", 1)[1] in self._core_targets)
+            if n_core != self.n_keys:
                 self._n_discard += 1
                 if self._dbg and self._n_discard <= 5:
-                    print(f"[DUMP-DEBUG] DISCARD forward (row_keys={len(row)}, expected n_keys="
-                          f"{self.n_keys}): this forward saw pre_attn={self._f_pre} routing={self._f_route}. "
-                          f"keys==0 -> taps never fired (begin_forward ran but the input_layernorm hook "
-                          f"and/or select_experts tap did not); keys>0 but <n_keys -> one tap fired, the "
+                    print(f"[DUMP-DEBUG] DISCARD forward (core_keys={n_core}, expected n_keys="
+                          f"{self.n_keys}, total_keys={len(row)}): this forward saw pre_attn={self._f_pre} routing={self._f_route}. "
+                          f"core==0 -> taps never fired (begin_forward ran but the input_layernorm hook "
+                          f"and/or select_experts tap did not); 0<core<n_keys -> one tap fired, the "
                           f"other did not (check both source edits are applied to THIS build).", flush=True)
                 return
             os.makedirs(self._seq_dir(), exist_ok=True)  # lazy: only for written forwards
@@ -259,6 +277,39 @@ class _Dumper:
             tk = self._slice1d(topk_ids, self.num_experts_per_tok, "topk_ids")
             self._buf.setdefault(f"L{layer_idx:02d}", {})["topk_ids"] = (
                 tk.detach().to(torch.int16).clone().cpu())
+
+    def record_cache_hits(self, on_device):
+        # NEW: per-routed-expert LRC-cache hit mask for the CURRENT layer, aligned 1:1 with
+        # the topk_ids already captured for this layer. on_device = set of expert ids resident
+        # in this layer's HBM cache, snapshotted in ExpertOffloadManager._update_weights BEFORE
+        # the on-demand load loop. 1 = hit (resident), 0 = miss (about to be paged in).
+        # Uses _cur_layer (decoder layer id stamped by the input_layernorm hook) so the tag
+        # matches topk_ids — NOT the offload manager's MoE-list layer_idx. Decode path only;
+        # prefill bulk-loads and never calls this. (user request)
+        if not self.enabled or not self._in_fwd or not self._capture:
+            return
+        with self._lock:
+            layer_idx = self._cur_layer
+            if layer_idx < self.num_hash or layer_idx >= self.num_total:
+                return
+            d = self._buf.get(f"L{layer_idx:02d}")
+            if d is None or "topk_ids" not in d:
+                # topk for this layer not captured yet (e.g. select_experts tap didn't run
+                # before paging) -> skip rather than emit a mask of the wrong order.
+                return
+            tk = d["topk_ids"]  # (num_experts_per_tok,) int16 cpu, routed-only, in routing order
+            try:
+                resident = {int(e) for e in on_device}
+            except TypeError:
+                return
+            # bool mask in EXACTLY topk_ids order: hits[i] tells whether topk_ids[i] was resident.
+            hits = torch.tensor([1 if int(e) in resident else 0 for e in tk.tolist()],
+                                 dtype=torch.bool)
+            d["lrc_cache_hit"] = hits
+            if self._dbg and self._dbg_cache_shape:
+                self._dbg_cache_shape = False
+                print(f"[DUMP-DEBUG] lrc_cache_hit tap fired @ layer {layer_idx}: "
+                      f"topk={tk.tolist()} hits={hits.tolist()} (1=resident, 0=miss)", flush=True)
 
     def mark_pre_attn(self, layer_idx, x):
         # NEW: called from a forward hook on each non-hash layer's input_layernorm, which

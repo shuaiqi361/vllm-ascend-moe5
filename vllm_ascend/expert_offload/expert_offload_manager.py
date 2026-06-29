@@ -18,6 +18,16 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
 
+# NEW: tensor-dump hook (no-op unless DUMP=1). Defensive import so a missing/broken dump
+# package never breaks the offload manager. (user request: LRC cache hit/miss target)
+try:
+    from vllm_ascend.dump.tensor_dump import DUMPER
+except Exception:
+    class _NoDump:
+        enabled = False
+        def record_cache_hits(self, *a, **k): pass
+    DUMPER = _NoDump()
+
 
 _SUBSCRIBED_COMPUTE_STREAMS = set()
 def get_subscribed_compute_streams() -> set:
@@ -922,8 +932,12 @@ class ExpertOffloadManager:
                     slot_owner[slot] = eid
 
             on_device = set(slot_owner.values())
-            already_there = needed & on_device           # no-op
+            already_there = needed & on_device             # no-op
             need_to_load = needed - already_there          # CPU→NPU copy
+
+            if DUMPER.enabled:
+                DUMPER.record_cache_hits(on_device)
+                
             if self.cache_policy is not None:
                 self._record_cache_stats(layer_idx, already_there, need_to_load,
                                          needed, on_device, topk_ids_h.shape[0])
