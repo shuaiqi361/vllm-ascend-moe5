@@ -1019,7 +1019,12 @@ class AscendFusedMoE(FusedMoE):
             after_routed_experts = torch.npu.current_stream().record_event()
             # capture the TRUE router input (bf16 MoE input) and the real fp32 gate logits here
             if DUMPER.enabled:
-                DUMPER.record_router_io(hidden_states, router_logits)
+                # CHANGE: also pass the gate's per-expert selection bias. gate.e_score_correction_bias
+                # is the exact (n_routed_experts,) fp32 vector added to sigmoid(router_logits) for
+                # selection (None on hash layers, which are not dumped). The no-op stub's
+                # record_router_io(self, *a, **k) already tolerates the extra arg. (user request)
+                DUMPER.record_router_io(hidden_states, router_logits,
+                                        getattr(gate, "e_score_correction_bias", None))
         else:
             before_routed_experts = torch.npu.current_stream().record_event()
             after_routed_experts = None

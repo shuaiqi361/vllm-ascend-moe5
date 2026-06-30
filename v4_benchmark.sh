@@ -49,7 +49,7 @@ NUM_DEVICE_EXPERTS="${NUM_DEVICE_EXPERTS:-24}"       # decode : resident experts
 NUM_DEVICE_LAYERS="${NUM_DEVICE_LAYERS:-1}"          # prefill: full-expert layers on NPU
 TOPK="${TOPK:-8}"                                    # model top_k; ONLY used for the threshold warning below
 CACHE_POLICY="${CACHE_POLICY:-1}"                    # 1 = LRC eviction policy
-CACHE_DEBUG="${CACHE_DEBUG:-1}"                      # your V4 command used true; set 0 for clean perf (seq-stats still summarizes)
+CACHE_DEBUG="${CACHE_DEBUG:-0}"                      # your V4 command used true; set 0 for clean perf (seq-stats still summarizes)
 CPU_BINDING="${CPU_BINDING:-0}"                      # enable_cpu_binding
 WPREFETCH="${WPREFETCH:-0}"                          # 1 = L2 weight prefetch (not in your command)
 
@@ -96,7 +96,7 @@ EXTRA_BENCH_FLAGS=(  ${EXTRA_BENCH_ARGS:-}  )        # raw flags appended to `vl
 # below can see DUMP. DUMP=0 (default) leaves this script's behavior unchanged.
 # Requires the dump SOURCE edits (driver + select_experts tap + model __init__
 # wiring) applied to THIS build; DUMP=1 is a no-op without them.
-DUMP="${DUMP:-0}"                                    # 1 = enable per-layer tensor dump
+DUMP="${DUMP:-1}"                                    # 1 = enable per-layer tensor dump
 # DUMP_DIR="${DUMP_DIR:-./dumps/$(date +%Y%m%d_%H%M%S)}"   # fresh dir per run (don't overwrite)
 DUMP_DIR="${DUMP_DIR:-/data/keyi/llms/sharegpt/pre-att-dump}"   # fresh dir per run (don't overwrite)
 DUMP_PLATFORM="${DUMP_PLATFORM:-npu}"                # tag written into metadata.json

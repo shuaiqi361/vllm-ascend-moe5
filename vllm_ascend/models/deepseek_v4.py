@@ -1120,6 +1120,13 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
                 num_hash_layers=config.num_hash_layers,
                 num_hidden_layers=config.num_hidden_layers,
                 scoring_func=getattr(config, "scoring_func", "softmax"),
+                # NEW: routing hyperparams so the dump can reproduce topk_ids from
+                # router_logits + router_bias offline (sigmoid -> +bias -> group top-k).
+                # Same getattr defaults the model uses at FusedMoE construction. (user request)
+                num_expert_group=getattr(config, "n_group", 1),
+                topk_group=getattr(config, "topk_group", 1),
+                norm_topk_prob=config.norm_topk_prob,
+                routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.5),
             )
 
             # begin/end_forward are driven by wrapping THIS module's forward (the

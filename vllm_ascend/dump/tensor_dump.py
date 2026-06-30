@@ -32,10 +32,11 @@ class _Dumper:
         self.num_hash = 0
         self.num_total = 0
         self.n_keys = 0
-        # NEW: the 4 mandatory ("core") targets every dumped layer must have for a forward to
-        # be written. lrc_cache_hit is an OPTIONAL 5th target (decode-only), so the integrity
-        # gate counts these core keys instead of the total key count. (user request)
-        self._core_targets = ("router_input", "pre_attn_input", "router_logits", "topk_ids")
+        # CHANGE: the mandatory ("core") targets every dumped layer must have for a forward to
+        # be written. router_bias is core (always present, every token). lrc_cache_hit (if you
+        # applied that guide) is NOT here — it is the optional decode-only target. The integrity
+        # gate counts these core keys. (user request: dump the routing selection bias)
+        self._core_targets = ("router_input", "pre_attn_input", "router_logits", "topk_ids", "router_bias")
         self.hidden_size = 0
         self.n_routed_experts = 0
         self.num_experts_per_tok = 0
@@ -44,7 +45,7 @@ class _Dumper:
         self._n_begin = 0; self._n_written = 0; self._n_discard = 0
         self._f_pre = 0; self._f_route = 0   # per-forward tap-fire counts
         self._dbg_route_shape = True; self._dbg_pre_shape = True  # one-shot shape prints
-        self._dbg_cache_shape = True  # NEW: one-shot print for the lrc_cache_hit tap
+        self._dbg_bias_shape = True  # NEW: one-shot print for the router_bias capture
         # per-forward state
         self._in_fwd = False
         self._capture = True      # False -> over the per-sequence cap: skip offload + write
@@ -62,14 +63,16 @@ class _Dumper:
             os.makedirs(self.dir, exist_ok=True)
 
     def configure(self, *, hidden_size, n_routed_experts, num_experts_per_tok,
-                  num_hash_layers, num_hidden_layers, scoring_func):
+                  num_hash_layers, num_hidden_layers, scoring_func,
+                  num_expert_group=1, topk_group=1, norm_topk_prob=True,
+                  routed_scaling_factor=1.0):
         # NEW: called once from the model __init__ with config dims; writes metadata.json.
+        # CHANGE: also takes the group-topk + scaling params so the dump is self-describing
+        # enough to REPRODUCE the selection from router_logits + router_bias. (user request)
         if not self.enabled or self._cfg_done:
             return
         # NEW: in a distributed run (TP/EP) the model __init__ runs on every rank, so
         # gate writing to global rank 0 only — otherwise N ranks race on the same files.
-        # Requires PP=1 (rank 0 holds all layers) and EP=1 (rank 0 sees the full,
-        # unsplit token set at select_experts). See Assumptions.
         try:
             import torch.distributed as dist
             if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
@@ -84,35 +87,43 @@ class _Dumper:
             self.n_routed_experts = n_routed_experts
             self.num_experts_per_tok = num_experts_per_tok
             tags = [f"L{i:02d}" for i in range(num_hash_layers, num_hidden_layers)]
-            # NEW: n_keys counts only the 4 mandatory core targets (the gate's invariant).
-            # lrc_cache_hit is additive and decode-only, so it is NOT included here.
+            # n_keys counts the core targets (now 5, incl. router_bias). lrc_cache_hit, if
+            # present, is additive/decode-only and excluded from this count.
             self.n_keys = len(tags) * len(self._core_targets)
             self._meta = {
                 "platform": os.environ.get("DUMP_PLATFORM", "npu"),
+                # CHANGE: record the routing hyperparams needed to reproduce topk_ids offline
+                # from router_logits + router_bias (sigmoid -> +bias -> group top-k).
                 "model": {"hidden_size": hidden_size, "n_routed_experts": n_routed_experts,
                           "num_experts_per_tok": num_experts_per_tok, "scoring_func": scoring_func,
+                          "num_expert_group": num_expert_group, "topk_group": topk_group,
+                          "norm_topk_prob": norm_topk_prob, "routed_scaling_factor": routed_scaling_factor,
                           "dumped_layer_indices": list(range(num_hash_layers, num_hidden_layers))},
-                "target_order": ["router_input", "pre_attn_input", "router_logits", "topk_ids"],
-                # NEW: lrc_cache_hit registered as an optional, decode-only target aligned to topk_ids.
+                "target_order": ["router_input", "pre_attn_input", "router_logits", "topk_ids", "router_bias"],
+                # NEW: lrc_cache_hit is registered here only if you also applied that guide; harmless to keep.
                 "optional_targets": ["lrc_cache_hit"],
                 "targets": {"router_input": {"dim": hidden_size, "dtype": "bfloat16"},
                             "pre_attn_input": {"dim": hidden_size, "dtype": "bfloat16"},
                             "router_logits": {"dim": n_routed_experts, "dtype": "float32"},
                             "topk_ids": {"dim": num_experts_per_tok, "dtype": "int16"},
+                            # NEW: the per-expert selection bias added to sigmoid(router_logits).
+                            "router_bias": {"dim": n_routed_experts, "dtype": "float32",
+                                            "is_parameter": True, "per_token": False,
+                                            "semantics": "= gate.e_score_correction_bias. Added to the "
+                                                         "sigmoid SCORES (not the logits) for expert "
+                                                         "selection via group top-k; routing weights use "
+                                                         "the UNBIASED scores. Layer-static (same every token)."},
                             "lrc_cache_hit": {"dim": num_experts_per_tok, "dtype": "bool",
                                               "availability": "decode_tokens_only",
-                                              "order": "aligned 1:1 with topk_ids (same routing order)",
-                                              "semantics": "1 = routed expert already resident in the LRC "
-                                                           "expert cache when the layer needed it; 0 = miss "
-                                                           "(loaded on demand). Absent on prefill token_00000."}},
+                                              "order": "aligned 1:1 with topk_ids"}},
                 "layer_tags": tags,
                 "key_scheme": "{layer_tag}.{target}  e.g. 'L03.router_logits'",
                 "layout": {
                     "<root>": "= DUMP_DIR, one directory per run",
-                    "<root>/metadata.json": "this file: run-level schema (model dims, the 4 core targets + optional lrc_cache_hit, layer tags)",
+                    "<root>/metadata.json": "this file: run-level schema (model dims + routing hyperparams, targets, layer tags)",
                     "<root>/seq_{i:06d}/": "one directory per generated sequence (one prompt at --max-num-seqs 1); enumerate by globbing seq_*",
                     "<root>/seq_{i:06d}/seq_meta.json": "that sequence's prompt_token_ids and output_token_ids (len == token-file count - 1)",
-                    "<root>/seq_{i:06d}/token_{j:05d}.pt": "one generated token (token_00000 = prefill/first token, token_k = decode k); a dict of {layer_tag}.{target} CPU tensors; decode tokens additionally carry {layer_tag}.lrc_cache_hit. load with torch.load(path, map_location='cpu', weights_only=True)",
+                    "<root>/seq_{i:06d}/token_{j:05d}.pt": "one generated token; dict of {layer_tag}.{target} CPU tensors (incl. router_bias every token; lrc_cache_hit on decode only if that guide is applied). load with torch.load(path, map_location='cpu', weights_only=True)",
                 },
                 "file_format": {"serialization": "torch.save",
                                 "load": "torch.load(path, map_location='cpu', weights_only=True)"},
@@ -188,11 +199,7 @@ class _Dumper:
                       f"is_prefill={self._is_prefill} capture={self._capture}", flush=True)
 
     def end_forward(self):
-        # NEW: end of each main-model forward. Writes the token immediately (prefill ->
-        # token 0, decode -> next index) plus seq_meta.json, so all data is durable on
-        # disk without relying on atexit (the EngineCore subprocess may be hard-killed).
-        if not self.enabled or not self._in_fwd:
-            return
+        # ... unchanged above (lock acquire, _in_fwd reset, over-cap early return) ...
         with self._lock:
             self._in_fwd = False
             if not self._capture:
@@ -201,15 +208,13 @@ class _Dumper:
                 return
             row = {f"{tag}.{name}": t for tag, d in self._buf.items() for name, t in d.items()}
             self._buf = {}
-            # Integrity gate: a correct main-model forward yields all dumped layers with all 4
-            # CORE targets, each keyed by its real layer id. Anything else (warmup, draft/MTP,
-            # a layer whose hooks didn't all fire, a misaligned stamp) is incomplete or
-            # mis-attributed -> discard and write nothing.
-            # CHANGE: gate on the count of CORE-target keys (== n_keys), not len(row). The
-            # optional decode-only lrc_cache_hit adds extra keys on decode tokens, so a total
-            # count would now exceed n_keys on decode and discard every decode forward. With
-            # <=4 core keys per tag and only (num_total-num_hash) possible tags, n_core==n_keys
-            # can ONLY be all dumped layers x 4 core targets -> correct per-layer attribution.
+            # Integrity gate: a correct main-model forward yields all dumped layers with all CORE
+            # targets (now 5, including router_bias), each keyed by its real layer id. Anything
+            # else (warmup, draft/MTP, a layer whose hooks didn't all fire, a misaligned stamp) is
+            # incomplete or mis-attributed -> discard and write nothing.
+            # CHANGE: gate on the count of CORE-target keys (== n_keys), not len(row). The optional
+            # decode-only lrc_cache_hit (if that guide is applied) adds extra keys on decode tokens,
+            # so a total count would exceed n_keys on decode and discard every decode forward.
             n_core = sum(1 for k in row if k.split(".", 1)[1] in self._core_targets)
             if n_core != self.n_keys:
                 self._n_discard += 1
@@ -217,8 +222,9 @@ class _Dumper:
                     print(f"[DUMP-DEBUG] DISCARD forward (core_keys={n_core}, expected n_keys="
                           f"{self.n_keys}, total_keys={len(row)}): this forward saw pre_attn={self._f_pre} routing={self._f_route}. "
                           f"core==0 -> taps never fired (begin_forward ran but the input_layernorm hook "
-                          f"and/or select_experts tap did not); 0<core<n_keys -> one tap fired, the "
-                          f"other did not (check both source edits are applied to THIS build).", flush=True)
+                          f"and/or the routing tap did not); 0<core<n_keys -> a tap fired for some "
+                          f"layers/targets but not all (check all source edits are applied to THIS build, "
+                          f"incl. passing gate.e_score_correction_bias into record_router_io).", flush=True)
                 return
             os.makedirs(self._seq_dir(), exist_ok=True)  # lazy: only for written forwards
             if self._is_prefill:
@@ -252,8 +258,12 @@ class _Dumper:
             f"expected ({expected_len},). Tap is at the wrong place or the layout changed.")
         return v
 
-    def record_router_io(self, hidden_states, router_logits):
+    def record_router_io(self, hidden_states, router_logits, e_score_correction_bias=None):
         # bf16 router input + fp32 gate logits, captured at the gate site (pre-prepare).
+        # CHANGE: also capture the per-expert selection bias (e_score_correction_bias). It is a
+        # (n_routed_experts,) fp32 PARAMETER on the gate (NOT a per-token activation): the router
+        # adds it to the sigmoid SCORES to choose experts (group top-k), while the routing weights
+        # use the UNBIASED scores. So topk_ids depends on router_logits AND this bias. (user request)
         if not self.enabled or not self._in_fwd or not self._capture:
             return
         with self._lock:
@@ -265,6 +275,21 @@ class _Dumper:
             d = self._buf.setdefault(f"L{layer_idx:02d}", {})
             d["router_input"] = ri.detach().to(torch.bfloat16).clone().cpu()
             d["router_logits"] = rl.detach().to(torch.float32).clone().cpu()
+            # NEW: the bias is a full (n_routed_experts,) vector with NO token dim, so do NOT
+            # slice [-1] — store it whole. It is None on hash layers (already excluded above);
+            # for MoE layers it is the gate's e_score_correction_bias parameter.
+            if e_score_correction_bias is not None:
+                b = e_score_correction_bias
+                if b.dim() > 1:
+                    b = b.squeeze()
+                assert b.dim() == 1 and b.shape[0] == self.n_routed_experts, (
+                    f"[DUMP] router_bias: {tuple(e_score_correction_bias.shape)} -> sliced {tuple(b.shape)}, "
+                    f"expected ({self.n_routed_experts},). Bias tap is at the wrong place or the layout changed.")
+                d["router_bias"] = b.detach().to(torch.float32).clone().cpu()
+                if self._dbg and self._dbg_bias_shape:
+                    self._dbg_bias_shape = False
+                    print(f"[DUMP-DEBUG] router_bias tap fired @ layer {layer_idx}: "
+                          f"shape={tuple(b.shape)} (fp32 gate.e_score_correction_bias)", flush=True)
 
     def record_topk(self, topk_ids):
         # routed-only selected expert ids, captured in select_experts (its only source).
